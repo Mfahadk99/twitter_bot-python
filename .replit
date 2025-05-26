@@ -6,3 +6,24 @@ channel = "stable-24_05"
 
 [deployment]
 run = ["sh", "-c", "python3 manage.py runserver 0.0.0.0:3000"]
+
+[workflows]
+runButton = "Twitter Monitor"
+
+[[workflows.workflow]]
+name = "Twitter Monitor"
+author = 42646103
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 twitter_bot.py"
+
+[[workflows.workflow]]
+name = "Streamlit Dashboard"
+author = 42646103
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "streamlit run streamlit_dasboard.py --server.port=5000 --server.address=0.0.0.0"

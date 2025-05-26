@@ -163,48 +163,106 @@ if selected_page == "Solana Tokens":
     tokens_with_twitter = db.tokens.count_documents({"processed": True})
     rug_passed = db.tokens.count_documents({"rugCheck.passed": True})
     birdeye_tokens = db.tokens.count_documents({"source": "birdeye"})
+    dexscreener_tokens = db.tokens.count_documents({"source": {"$ne": "birdeye"}})
+    monitored_tokens = db.tokens.count_documents({"currentMarketCap": {"$exists": True}})
+    
     avg_score = list(db.tokens.aggregate([
         {"$match": {"rugCheck.score": {"$exists": True}}},
         {"$group": {"_id": None, "avgScore": {"$avg": "$rugCheck.score"}}}
     ]))
     avg_score = avg_score[0]['avgScore'] if avg_score else 0
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Total Tokens", total_tokens)
-    col2.metric("Birdeye Tokens", birdeye_tokens)
-    col3.metric("With Twitter Profiles", tokens_with_twitter)
-    col4.metric("Passed Rug Check", rug_passed)
-    col5.metric("Avg Rug Score", f"{avg_score:.2f}")
+    col2.metric("🦅 Birdeye", birdeye_tokens)
+    col3.metric("📊 DexScreener", dexscreener_tokens)
+    col4.metric("✅ Passed Rug Check", rug_passed)
+    col5.metric("📈 Monitored", monitored_tokens)
+    col6.metric("Avg Rug Score", f"{avg_score:.2f}")
 
     # Market Cap Monitoring Section
     st.subheader("📈 Real-time Market Cap Monitoring")
+    
+    # Auto-refresh indicator
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.write("**Live Token Performance** (Auto-refreshes every 60 seconds)")
+    with col2:
+        if st.button("🔄 Refresh Now"):
+            st.rerun()
 
-    # Get tokens with recent market cap data
+    # Get tokens with recent market cap data, prioritizing recent updates
     recent_marketcap = list(db.tokens.find({
         "rugCheck.passed": True,
-        "currentMarketCap": {"$exists": True}
-    }).sort("lastMarketCapCheck", -1).limit(10))
+        "currentMarketCap": {"$exists": True},
+        "source": "birdeye"  # Focus on Birdeye tokens
+    }).sort("lastMarketCapCheck", -1).limit(15))
 
     if recent_marketcap:
-        for token in recent_marketcap:
+        # Summary metrics
+        total_mc = sum(token.get('currentMarketCap', 0) for token in recent_marketcap)
+        avg_change = sum(token.get('marketCapChange', 0) for token in recent_marketcap if token.get('marketCapChange')) / len([t for t in recent_marketcap if t.get('marketCapChange')])
+        
+        st.metric("Total Market Cap (Top 15)", f"${total_mc:,.0f}", f"{avg_change:+.1f}% avg change" if avg_change else None)
+        
+        # Create a more detailed table view
+        for i, token in enumerate(recent_marketcap):
             with st.container():
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 1])
+                
                 with col1:
-                    st.write(f"**{token.get('symbol', 'Unknown')}**")
-                    st.caption(f"{token['tokenAddress'][:8]}...")
+                    symbol = token.get('symbol', 'Unknown')
+                    name = token.get('name', 'Unknown')
+                    st.write(f"**{symbol}**")
+                    st.caption(f"{name[:20]}...")
+                    st.caption(f"{token['tokenAddress'][:12]}...")
+                
                 with col2:
                     market_cap = token.get('currentMarketCap', 0)
-                    st.metric("Market Cap", f"${market_cap:,.0f}" if market_cap else "N/A")
+                    mc_change = token.get('marketCapChange', 0)
+                    st.metric("Market Cap", 
+                             f"${market_cap:,.0f}" if market_cap else "N/A",
+                             f"{mc_change:+.1f}%" if mc_change else None)
+                
                 with col3:
                     price = token.get('currentPrice', 0)
-                    st.metric("Price", f"${price:.6f}" if price else "N/A")
+                    price_change = token.get('priceChange24h', 0)
+                    st.metric("Price", 
+                             f"${price:.6f}" if price else "N/A",
+                             f"{price_change:+.1f}%" if price_change else None)
+                
                 with col4:
+                    volume = token.get('currentVolume24h', 0)
+                    liquidity = token.get('currentLiquidity', 0)
+                    st.metric("Volume 24h", f"${volume:,.0f}" if volume else "N/A")
+                    st.caption(f"Liquidity: ${liquidity:,.0f}" if liquidity else "No data")
+                
+                with col5:
                     last_check = token.get('lastMarketCapCheck')
                     if last_check:
+                        time_diff = datetime.now(mst) - last_check.replace(tzinfo=mst)
+                        if time_diff.total_seconds() < 60:
+                            st.success("🟢 Live")
+                        elif time_diff.total_seconds() < 300:
+                            st.warning("🟡 Recent")
+                        else:
+                            st.error("🔴 Stale")
                         st.caption(f"Updated: {last_check.strftime('%H:%M:%S')}")
-                st.divider()
+                    else:
+                        st.error("❓ No data")
+                
+                # Add progress indicator for high-performing tokens
+                if mc_change and abs(mc_change) > 10:
+                    color = "green" if mc_change > 0 else "red"
+                    st.markdown(f"<div style='background-color: {color}; opacity: 0.1; height: 2px; width: 100%;'></div>", unsafe_allow_html=True)
+                else:
+                    st.divider()
     else:
         st.info("No tokens with market cap data yet. Wait for monitoring to begin.")
+        st.write("The system needs to:")
+        st.write("1. Fetch new tokens from Birdeye")
+        st.write("2. Run RugCheck analysis")
+        st.write("3. Start market cap monitoring for passed tokens")
 
     # Market Cap History Chart
     if st.button("📊 Show Market Cap Trends"):
