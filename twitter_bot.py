@@ -456,41 +456,47 @@ class SolanaTwitterMonitor:
 
     async def fetch_latest_solana_tokens(self) -> List[Dict]:
         try:
-            # Prioritize Birdeye for new token discovery
-            dex_logger.info("Fetching new tokens from Birdeye...")
+            # Step 1: Fetch new tokens from Birdeye
+            dex_logger.info("Step 1: Fetching new tokens from Birdeye...")
             birdeye_tokens = await self.fetch_birdeye_new_tokens()
             
-            # Only use DexScreener as fallback if Birdeye fails
             if not birdeye_tokens:
-                dex_logger.warning("No tokens from Birdeye, falling back to DexScreener...")
-                dexscreener_tokens = await self._fetch_dexscreener_tokens()
-            else:
-                dex_logger.info("Successfully got tokens from Birdeye, skipping DexScreener")
-                dexscreener_tokens = []
+                dex_logger.warning("No tokens from Birdeye!")
+                return []
 
-            # Combine tokens, prioritizing Birdeye
-            all_tokens = birdeye_tokens + dexscreener_tokens
-            unique_tokens = {}
-
-            # Validate token addresses and deduplicate
-            for token in all_tokens:
+            # Step 2: Enhance tokens with DexScreener metadata (social links)
+            dex_logger.info(f"Step 2: Enhancing {len(birdeye_tokens)} tokens with DexScreener metadata...")
+            enhanced_tokens = []
+            
+            for token in birdeye_tokens:
                 token_address = token.get("tokenAddress")
-                if token_address and len(token_address) == 44:
-                    # Skip if already processed recently
-                    if not await self.is_token_processed(token_address):
-                        unique_tokens[token_address] = token
-                        dex_logger.info(f"Added token for processing: {token_address}")
-                    else:
-                        dex_logger.debug(f"Skipping already processed token: {token_address}")
-                elif token_address:
-                    dex_logger.debug(f"Skipping invalid token address format: {token_address}")
+                if not token_address or len(token_address) != 44:
+                    continue
+                    
+                # Skip if already processed recently
+                if await self.is_token_processed(token_address):
+                    dex_logger.debug(f"Skipping already processed token: {token_address}")
+                    continue
 
-            final_tokens = list(unique_tokens.values())
-            dex_logger.info(f"Final token count - Birdeye: {len(birdeye_tokens)}, DexScreener: {len(dexscreener_tokens)}, Unique: {len(final_tokens)}")
-            return final_tokens
+                # Get social links from DexScreener
+                socials_data = await self.get_token_socials_from_dexscreener(token_address)
+                if socials_data and "links" in socials_data:
+                    token["links"] = socials_data["links"]
+                    enhanced_tokens.append(token)
+                    dex_logger.info(f"Enhanced token with social links: {token_address}")
+                else:
+                    # Still include token even without social links for RugCheck
+                    enhanced_tokens.append(token)
+                    dex_logger.debug(f"No social links found for token: {token_address}")
+
+                # Small delay to avoid hitting DexScreener rate limits
+                await asyncio.sleep(0.3)
+
+            dex_logger.info(f"Enhanced {len(enhanced_tokens)} tokens with metadata")
+            return enhanced_tokens
 
         except Exception as e:
-            dex_logger.error(f"Error fetching Solana tokens: {str(e)}")
+            dex_logger.error(f"Error in token fetching flow: {str(e)}")
             return []
 
     async def _fetch_dexscreener_tokens(self) -> List[Dict]:
@@ -516,6 +522,41 @@ class SolanaTwitterMonitor:
             await self.initialize_db()
         result = await self.db.tokens.find_one({"tokenAddress": token_address})
         return result is not None
+
+    async def save_failed_token(self, token: Dict, rug_check: Dict):
+        """Save tokens that failed RugCheck"""
+        if not await self.is_db_initialized():
+            await self.initialize_db()
+        
+        await self.db.tokens.update_one(
+            {"tokenAddress": token["tokenAddress"]},
+            {"$set": {
+                **token,
+                "rugCheck": rug_check,
+                "processed": True,
+                "processedAt": datetime.now(mst),
+                "status": "failed_rugcheck"
+            }},
+            upsert=True
+        )
+
+    async def save_passed_token(self, token: Dict, rug_check: Dict):
+        """Save tokens that passed RugCheck and mark for monitoring"""
+        if not await self.is_db_initialized():
+            await self.initialize_db()
+        
+        await self.db.tokens.update_one(
+            {"tokenAddress": token["tokenAddress"]},
+            {"$set": {
+                **token,
+                "rugCheck": rug_check,
+                "processed": True,
+                "processedAt": datetime.now(mst),
+                "status": "passed_rugcheck",
+                "monitorMarketCap": True  # Flag for market cap monitoring
+            }},
+            upsert=True
+        )
 
     async def basic_rug_check(self, token_data: Dict) -> Dict:
         token_address = token_data.get("tokenAddress")
@@ -598,23 +639,27 @@ class SolanaTwitterMonitor:
             if await self.is_token_processed(token_address):
                 continue
 
+            # Step 3: Run RugCheck validation - CRITICAL STEP
+            dex_logger.info(f"Step 3: Running RugCheck for token: {token_address}")
             rug_check = await self.basic_rug_check(token)
+            
             if not rug_check["passed"]:
-                dex_logger.info(f"Skipping token {token_address} - failed basic rug check")
+                dex_logger.info(f"❌ Token {token_address} FAILED RugCheck - excluding from dashboard")
+                # Still save to DB but mark as failed
+                await self.save_failed_token(token, rug_check)
                 continue
+            else:
+                dex_logger.info(f"✅ Token {token_address} PASSED RugCheck - will be monitored")
 
-            # If token doesn't have links (Birdeye tokens), try to get them from DexScreener
-            if "links" not in token and token.get("source") == "birdeye":
-                dex_logger.info(f"Getting social links from DexScreener for Birdeye token: {token_address}")
-                socials_data = await self.get_token_socials_from_dexscreener(token_address)
-                if socials_data and "links" in socials_data:
-                    token["links"] = socials_data["links"]
-
-            # Skip if still no links
+            # Only process tokens that passed RugCheck
+            # Look for Twitter links in the metadata we got from DexScreener
             if "links" not in token:
                 dex_logger.info(f"No social links found for token: {token_address}")
+                # Still save passed tokens even without Twitter
+                await self.save_passed_token(token, rug_check)
                 continue
 
+            # Extract Twitter profiles for passed tokens
             for link in token["links"]:
                 if link.get("type") == "twitter" or "twitter.com" in link.get("url", "") or "x.com" in link.get("url", ""):
                     profile_url = link["url"]
@@ -630,6 +675,7 @@ class SolanaTwitterMonitor:
                             "createdAt": datetime.now(mst)
                         })
 
+        dex_logger.info(f"Found {len(twitter_profiles)} Twitter profiles from tokens that passed RugCheck")
         return twitter_profiles
 
     async def verify_twitter_account(self, username: str) -> Dict:
@@ -829,15 +875,17 @@ class SolanaTwitterMonitor:
                 start_time = time.time()
 
                 # Find tokens that passed rug check and need market cap monitoring
-                # Prioritize tokens created more recently
+                # Only monitor tokens that explicitly passed RugCheck
                 cursor = self.db.tokens.find({
+                    "status": "passed_rugcheck",  # Only tokens that passed our flow
                     "rugCheck.passed": True,
-                    "source": "birdeye",  # Focus on Birdeye tokens
+                    "source": "birdeye",
+                    "monitorMarketCap": True,  # Explicitly flagged for monitoring
                     "$or": [
                         {"lastMarketCapCheck": {"$exists": False}},
                         {"lastMarketCapCheck": {"$lt": datetime.now(mst) - timedelta(seconds=self.marketcap_monitor_interval)}}
                     ]
-                }).sort("createdAt", -1).limit(30)  # Increased limit and sort by newest
+                }).sort("processedAt", -1).limit(20)  # Focus on recently processed tokens
 
                 tokens = await cursor.to_list(length=30)
 

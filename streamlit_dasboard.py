@@ -158,13 +158,13 @@ selected_page = st.sidebar.radio("Navigation", pages)
 if selected_page == "Solana Tokens":
     st.header("🪙 Solana Tokens Analysis")
 
-    # Token Overview Metrics with Birdeye integration
+    # Token Overview Metrics following correct flow
     total_tokens = db.tokens.count_documents({})
-    tokens_with_twitter = db.tokens.count_documents({"processed": True})
-    rug_passed = db.tokens.count_documents({"rugCheck.passed": True})
-    birdeye_tokens = db.tokens.count_documents({"source": "birdeye"})
-    dexscreener_tokens = db.tokens.count_documents({"source": {"$ne": "birdeye"}})
-    monitored_tokens = db.tokens.count_documents({"currentMarketCap": {"$exists": True}})
+    tokens_processed = db.tokens.count_documents({"processed": True})
+    rug_passed = db.tokens.count_documents({"status": "passed_rugcheck"})
+    rug_failed = db.tokens.count_documents({"status": "failed_rugcheck"})
+    monitored_tokens = db.tokens.count_documents({"monitorMarketCap": True, "currentMarketCap": {"$exists": True}})
+    from_birdeye = db.tokens.count_documents({"source": "birdeye"})
     
     avg_score = list(db.tokens.aggregate([
         {"$match": {"rugCheck.score": {"$exists": True}}},
@@ -174,10 +174,10 @@ if selected_page == "Solana Tokens":
 
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Total Tokens", total_tokens)
-    col2.metric("🦅 Birdeye", birdeye_tokens)
-    col3.metric("📊 DexScreener", dexscreener_tokens)
-    col4.metric("✅ Passed Rug Check", rug_passed)
-    col5.metric("📈 Monitored", monitored_tokens)
+    col2.metric("🦅 From Birdeye", from_birdeye)
+    col3.metric("✅ Passed RugCheck", rug_passed)
+    col4.metric("❌ Failed RugCheck", rug_failed)
+    col5.metric("📈 Being Monitored", monitored_tokens)
     col6.metric("Avg Rug Score", f"{avg_score:.2f}")
 
     # Market Cap Monitoring Section
@@ -191,11 +191,12 @@ if selected_page == "Solana Tokens":
         if st.button("🔄 Refresh Now"):
             st.rerun()
 
-    # Get tokens with recent market cap data, prioritizing recent updates
+    # Get tokens with recent market cap data - ONLY show tokens that passed RugCheck
     recent_marketcap = list(db.tokens.find({
+        "status": "passed_rugcheck",  # Only tokens that passed our validation flow
         "rugCheck.passed": True,
         "currentMarketCap": {"$exists": True},
-        "source": "birdeye"  # Focus on Birdeye tokens
+        "source": "birdeye"
     }).sort("lastMarketCapCheck", -1).limit(15))
 
     if recent_marketcap:
