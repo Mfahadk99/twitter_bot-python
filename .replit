@@ -3,6 +3,7 @@ run = "python3 manage.py runserver 0.0.0.0:3000"
 
 [nix]
 channel = "stable-24_05"
+packages = ["arrow-cpp", "cacert", "cargo", "coreutils", "freetype", "geckodriver", "glibcLocales", "lcms2", "libiconv", "libimagequant", "libjpeg", "libtiff", "libwebp", "libxcrypt", "openjpeg", "pgadmin4", "pkg-config", "rustc", "tcl", "tk", "zlib"]
 
 [deployment]
 run = ["sh", "-c", "python3 manage.py runserver 0.0.0.0:3000"]

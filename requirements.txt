@@ -83,3 +83,4 @@ extra-streamlit-components==0.1.71
 solders==0.21.0
 fastapi==0.104.1
 uvicorn==0.24.0
+starlette
