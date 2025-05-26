@@ -158,21 +158,71 @@ selected_page = st.sidebar.radio("Navigation", pages)
 if selected_page == "Solana Tokens":
     st.header("🪙 Solana Tokens Analysis")
 
-    # Token Overview Metrics (unchanged)
+    # Token Overview Metrics with Birdeye integration
     total_tokens = db.tokens.count_documents({})
     tokens_with_twitter = db.tokens.count_documents({"processed": True})
     rug_passed = db.tokens.count_documents({"rugCheck.passed": True})
+    birdeye_tokens = db.tokens.count_documents({"source": "birdeye"})
     avg_score = list(db.tokens.aggregate([
         {"$match": {"rugCheck.score": {"$exists": True}}},
         {"$group": {"_id": None, "avgScore": {"$avg": "$rugCheck.score"}}}
     ]))
     avg_score = avg_score[0]['avgScore'] if avg_score else 0
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Tokens", total_tokens)
-    col2.metric("With Twitter Profiles", tokens_with_twitter)
-    col3.metric("Passed Rug Check", rug_passed)
-    col4.metric("Avg Rug Score", f"{avg_score:.2f}")
+    col2.metric("Birdeye Tokens", birdeye_tokens)
+    col3.metric("With Twitter Profiles", tokens_with_twitter)
+    col4.metric("Passed Rug Check", rug_passed)
+    col5.metric("Avg Rug Score", f"{avg_score:.2f}")
+
+    # Market Cap Monitoring Section
+    st.subheader("📈 Real-time Market Cap Monitoring")
+
+    # Get tokens with recent market cap data
+    recent_marketcap = list(db.tokens.find({
+        "rugCheck.passed": True,
+        "currentMarketCap": {"$exists": True}
+    }).sort("lastMarketCapCheck", -1).limit(10))
+
+    if recent_marketcap:
+        for token in recent_marketcap:
+            with st.container():
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.write(f"**{token.get('symbol', 'Unknown')}**")
+                    st.caption(f"{token['tokenAddress'][:8]}...")
+                with col2:
+                    market_cap = token.get('currentMarketCap', 0)
+                    st.metric("Market Cap", f"${market_cap:,.0f}" if market_cap else "N/A")
+                with col3:
+                    price = token.get('currentPrice', 0)
+                    st.metric("Price", f"${price:.6f}" if price else "N/A")
+                with col4:
+                    last_check = token.get('lastMarketCapCheck')
+                    if last_check:
+                        st.caption(f"Updated: {last_check.strftime('%H:%M:%S')}")
+                st.divider()
+    else:
+        st.info("No tokens with market cap data yet. Wait for monitoring to begin.")
+
+    # Market Cap History Chart
+    if st.button("📊 Show Market Cap Trends"):
+        history_data = list(db.marketcap_history.find({}).sort("timestamp", -1).limit(100))
+        if history_data:
+            df_history = pd.DataFrame([{
+                'timestamp': h['timestamp'],
+                'token': h['tokenAddress'][:8] + '...',
+                'marketCap': h['marketCap'],
+                'price': h['price']
+            } for h in history_data])
+
+            fig = px.line(df_history, x='timestamp', y='marketCap', color='token',
+                         title="Market Cap Over Time", 
+                         labels={'marketCap': 'Market Cap ($)', 'timestamp': 'Time'})
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No market cap history available yet.")
 
     # Add filters (unchanged)
     st.subheader("🔍 Filter Tokens")
@@ -243,6 +293,24 @@ if selected_page == "Solana Tokens":
                 """, unsafe_allow_html=True)
 
                 st.write(f"**Created:** {token.get('createdAt', datetime.utcnow()).strftime('%Y-%m-%d %H:%M')}")
+
+                # Show token source
+                source = token.get('source', 'dexscreener')
+                source_emoji = "🦅" if source == "birdeye" else "📊"
+                st.write(f"**Source:** {source_emoji} {source.title()}")
+
+                # Show Birdeye-specific data if available
+                if source == "birdeye":
+                    current_mc = token.get('currentMarketCap')
+                    current_price = token.get('currentPrice')
+                    if current_mc:
+                        st.write(f"**Current Market Cap:** ${current_mc:,.0f}")
+                    if current_price:
+                        st.write(f"**Current Price:** ${current_price:.6f}")
+
+                    last_check = token.get('lastMarketCapCheck')
+                    if last_check:
+                        st.write(f"**Last Updated:** {last_check.strftime('%H:%M:%S')}")
 
                 if 'rugCheck' in token:
                     rug = token['rugCheck']
@@ -701,7 +769,7 @@ elif selected_page == "Account Management":
                     if 'email' in account and account['email']:
                         st.write(f"**Email:** {account['email']}")
                     if 'proxy' in account and account['proxy']:
-                        st.write(f"**Proxy:** {account['proxy']}")
+                        st.write(f`**Proxy:** {account['proxy']}")
                 with col2:
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
