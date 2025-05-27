@@ -96,14 +96,8 @@ class SolanaTwitterMonitor:
         self.api = API(raise_when_no_account=True)
         self.poll_interval = 300
         self.monitor_interval = 900
-        self.marketcap_monitor_interval = 15  # Monitor every 15 seconds for faster updates
         self.session = aiohttp.ClientSession()
         self.dexscreener_url = "https://api.dexscreener.com/token-profiles/latest/v1?chainId=solana"
-        self.birdeye_base_url = "https://public-api.birdeye.so"
-        self.birdeye_headers = {
-            "X-API-KEY": os.getenv("BIRDEYE_API_KEY", ""),
-            "Accept": "application/json"
-        }
         self.request_times = deque(maxlen=60)
         self.rate_limit = 60
         self.monitoring_task = None
@@ -112,8 +106,6 @@ class SolanaTwitterMonitor:
         self.rugcheck_api_url = "https://api.rugcheck.xyz/v1/tokens"
         self.wallet = self._initialize_wallet()
         self.rugcheck_token = None
-        self.birdeye_request_times = deque(maxlen=60)
-        self.birdeye_rate_limit = 100  # Birdeye allows 100 requests per minute
 
     async def initialize_db(self):
         self.client = AsyncIOMotorClient(self.mongo_uri)
@@ -274,229 +266,31 @@ class SolanaTwitterMonitor:
             rug_logger.error(f"Error in rate_limited_get: {str(e)}")
             return None
 
-    async def birdeye_rate_limited_get(self, url: str) -> Optional[Dict]:
-        now = time.time()
-
-        # Clean old requests from the time window
-        while self.birdeye_request_times and now - self.birdeye_request_times[0] > 60:
-            self.birdeye_request_times.popleft()
-
-        # Check if we've hit the rate limit
-        if len(self.birdeye_request_times) >= self.birdeye_rate_limit:
-            sleep_time = 60 - (now - self.birdeye_request_times[0])
-            dex_logger.warning(f"Birdeye rate limit reached. Sleeping for {sleep_time:.2f} seconds")
-            await asyncio.sleep(sleep_time)
-
-        max_retries = 3
-        retry_delay = 2
-
-        for attempt in range(max_retries):
-            try:
-                async with self.session.get(url, headers=self.birdeye_headers, timeout=10) as response:
-                    self.birdeye_request_times.append(time.time())
-                    
-                    if response.status == 200:
-                        try:
-                            data = await response.json()
-                            return data
-                        except Exception as json_error:
-                            dex_logger.error(f"Failed to parse JSON from Birdeye: {json_error}")
-                            return None
-                    elif response.status == 429:
-                        retry_after = int(response.headers.get('Retry-After', 60))
-                        dex_logger.warning(f"Birdeye rate limited. Waiting {retry_after} seconds (attempt {attempt + 1}/{max_retries})")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    elif response.status == 400:
-                        dex_logger.error(f"Bad request to Birdeye API: {url}")
-                        return None
-                    else:
-                        dex_logger.error(f"Birdeye API error: HTTP {response.status} for URL: {url}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay)
-                        continue
-                        
-            except asyncio.TimeoutError:
-                dex_logger.warning(f"Timeout requesting Birdeye API (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-            except Exception as e:
-                dex_logger.error(f"Error in birdeye_rate_limited_get: {str(e)} (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-
-        return None
-
-    async def fetch_birdeye_new_tokens(self) -> List[Dict]:
-        """Fetch new tokens from Birdeye API"""
-        try:
-            # Get new tokens from Birdeye's new listings endpoint
-            new_tokens_url = f"{self.birdeye_base_url}/defi/tokenlist?sort_by=recently_update&sort_type=desc&offset=0&limit=100"
-            new_tokens_data = await self.birdeye_rate_limited_get(new_tokens_url)
-            
-            if not new_tokens_data or not new_tokens_data.get('success'):
-                dex_logger.warning("Failed to fetch new tokens from Birdeye, trying trending tokens")
-                # Fallback to trending tokens
-                trending_url = f"{self.birdeye_base_url}/defi/trending"
-                trending_data = await self.birdeye_rate_limited_get(trending_url)
-                
-                if not trending_data or not trending_data.get('success'):
-                    dex_logger.error("Failed to fetch any tokens from Birdeye")
-                    return []
-                
-                new_tokens_data = trending_data
-
-            tokens = []
-            token_list = new_tokens_data.get('data', {}).get('tokens', []) or new_tokens_data.get('data', [])
-            
-            # Process each token
-            for token_info in token_list[:50]:  # Limit to first 50
-                token_address = token_info.get('address')
-                if not token_address or len(token_address) != 44:
-                    continue
-                
-                # Skip if already processed recently
-                if await self.is_token_processed(token_address):
-                    continue
-                
-                # Get detailed token info
-                detail_url = f"{self.birdeye_base_url}/defi/token_overview?address={token_address}"
-                detail_data = await self.birdeye_rate_limited_get(detail_url)
-                
-                if detail_data and detail_data.get('success'):
-                    token_detail = detail_data.get('data', {})
-                    
-                    # Filter tokens by basic criteria
-                    market_cap = token_detail.get('mc', 0)
-                    liquidity = token_detail.get('liquidity', 0)
-                    
-                    # Skip tokens with very low market cap or liquidity
-                    if market_cap < 1000 or liquidity < 500:
-                        continue
-                    
-                    # Convert Birdeye format to our expected format
-                    processed_token = {
-                        'tokenAddress': token_address,
-                        'name': token_detail.get('name', ''),
-                        'symbol': token_detail.get('symbol', ''),
-                        'decimals': token_detail.get('decimals', 9),
-                        'supply': token_detail.get('supply', 0),
-                        'price': token_detail.get('price', 0),
-                        'priceChange24h': token_detail.get('priceChange24h', 0),
-                        'volume24h': token_detail.get('volume24h', 0),
-                        'marketCap': market_cap,
-                        'liquidity': liquidity,
-                        'createdAt': datetime.now(mst),
-                        'source': 'birdeye'
-                    }
-                    tokens.append(processed_token)
-                    dex_logger.info(f"Processed Birdeye token: {token_address} - MC: ${market_cap:,.0f}")
-                else:
-                    dex_logger.warning(f"Failed to get details for token: {token_address}")
-                
-                # Small delay to avoid hitting rate limits
-                await asyncio.sleep(0.2)
-                
-            dex_logger.info(f"Successfully fetched {len(tokens)} new tokens from Birdeye")
-            return tokens
-            
-        except Exception as e:
-            dex_logger.error(f"Error fetching tokens from Birdeye: {str(e)}")
-            return []
-
-    async def get_token_socials_from_dexscreener(self, token_address: str) -> Optional[Dict]:
-        """Get social links for a token from DexScreener"""
-        try:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-            data = await self.rate_limited_get(url)
-            
-            if not data or 'pairs' not in data:
-                return None
-                
-            # Look for the first pair with social links
-            for pair in data['pairs']:
-                if 'info' in pair and 'socials' in pair['info']:
-                    return {
-                        'links': [
-                            {'type': social['type'], 'url': social['url']}
-                            for social in pair['info']['socials']
-                            if social.get('type') and social.get('url')
-                        ]
-                    }
-            
-            return None
-            
-        except Exception as e:
-            dex_logger.error(f"Error getting socials from DexScreener for {token_address}: {str(e)}")
-            return None
-
-    async def monitor_token_marketcap(self, token_address: str) -> Optional[Dict]:
-        """Monitor specific token's market cap and other metrics"""
-        try:
-            url = f"{self.birdeye_base_url}/defi/token_overview?address={token_address}"
-            data = await self.birdeye_rate_limited_get(url)
-            
-            if data and data.get('success'):
-                token_data = data.get('data', {})
-                return {
-                    'tokenAddress': token_address,
-                    'price': token_data.get('price', 0),
-                    'marketCap': token_data.get('mc', 0),
-                    'volume24h': token_data.get('volume24h', 0),
-                    'priceChange24h': token_data.get('priceChange24h', 0),
-                    'liquidity': token_data.get('liquidity', 0),
-                    'timestamp': datetime.now(mst)
-                }
-            
-            return None
-            
-        except Exception as e:
-            dex_logger.error(f"Error monitoring token {token_address}: {str(e)}")
-            return None
-
     async def fetch_latest_solana_tokens(self) -> List[Dict]:
         try:
-            # Step 1: Fetch new tokens from Birdeye
-            dex_logger.info("Step 1: Fetching new tokens from Birdeye...")
-            birdeye_tokens = await self.fetch_birdeye_new_tokens()
-            
-            if not birdeye_tokens:
-                dex_logger.warning("No tokens from Birdeye!")
-                return []
+            dexscreener_tokens = await self._fetch_dexscreener_tokens()
 
-            # Step 2: Enhance tokens with DexScreener metadata (social links)
-            dex_logger.info(f"Step 2: Enhancing {len(birdeye_tokens)} tokens with DexScreener metadata...")
-            enhanced_tokens = []
-            
-            for token in birdeye_tokens:
+            combined_tokens = dexscreener_tokens
+            unique_tokens = {}
+
+            valid_tokens = []
+            for token in combined_tokens:
                 token_address = token.get("tokenAddress")
-                if not token_address or len(token_address) != 44:
-                    continue
-                    
-                # Skip if already processed recently
-                if await self.is_token_processed(token_address):
-                    dex_logger.debug(f"Skipping already processed token: {token_address}")
-                    continue
+                if token_address and len(token_address) == 44:
+                    valid_tokens.append(token)
+                    dex_logger.info(f"Processing token address: {token_address}")
+                elif token_address:
+                    rug_logger.debug(f"Skipping invalid token address format: {token_address}")
 
-                # Get social links from DexScreener
-                socials_data = await self.get_token_socials_from_dexscreener(token_address)
-                if socials_data and "links" in socials_data:
-                    token["links"] = socials_data["links"]
-                    enhanced_tokens.append(token)
-                    dex_logger.info(f"Enhanced token with social links: {token_address}")
-                else:
-                    # Still include token even without social links for RugCheck
-                    enhanced_tokens.append(token)
-                    dex_logger.debug(f"No social links found for token: {token_address}")
+            for token in valid_tokens[:1000]:
+                token_address = token.get("tokenAddress")
+                if token_address not in unique_tokens or "links" in token:
+                    unique_tokens[token_address] = token
 
-                # Small delay to avoid hitting DexScreener rate limits
-                await asyncio.sleep(0.3)
-
-            dex_logger.info(f"Enhanced {len(enhanced_tokens)} tokens with metadata")
-            return enhanced_tokens
+            return list(unique_tokens.values())
 
         except Exception as e:
-            dex_logger.error(f"Error in token fetching flow: {str(e)}")
+            rug_logger.error(f"Error fetching Solana tokens: {str(e)}")
             return []
 
     async def _fetch_dexscreener_tokens(self) -> List[Dict]:
@@ -522,41 +316,6 @@ class SolanaTwitterMonitor:
             await self.initialize_db()
         result = await self.db.tokens.find_one({"tokenAddress": token_address})
         return result is not None
-
-    async def save_failed_token(self, token: Dict, rug_check: Dict):
-        """Save tokens that failed RugCheck"""
-        if not await self.is_db_initialized():
-            await self.initialize_db()
-        
-        await self.db.tokens.update_one(
-            {"tokenAddress": token["tokenAddress"]},
-            {"$set": {
-                **token,
-                "rugCheck": rug_check,
-                "processed": True,
-                "processedAt": datetime.now(mst),
-                "status": "failed_rugcheck"
-            }},
-            upsert=True
-        )
-
-    async def save_passed_token(self, token: Dict, rug_check: Dict):
-        """Save tokens that passed RugCheck and mark for monitoring"""
-        if not await self.is_db_initialized():
-            await self.initialize_db()
-        
-        await self.db.tokens.update_one(
-            {"tokenAddress": token["tokenAddress"]},
-            {"$set": {
-                **token,
-                "rugCheck": rug_check,
-                "processed": True,
-                "processedAt": datetime.now(mst),
-                "status": "passed_rugcheck",
-                "monitorMarketCap": True  # Flag for market cap monitoring
-            }},
-            upsert=True
-        )
 
     async def basic_rug_check(self, token_data: Dict) -> Dict:
         token_address = token_data.get("tokenAddress")
@@ -630,6 +389,9 @@ class SolanaTwitterMonitor:
         processed_tokens = set()
 
         for token in tokens:
+            if "links" not in token:
+                continue
+
             token_address = token.get("tokenAddress", "")
             if not token_address or token_address in processed_tokens:
                 continue
@@ -639,27 +401,11 @@ class SolanaTwitterMonitor:
             if await self.is_token_processed(token_address):
                 continue
 
-            # Step 3: Run RugCheck validation - CRITICAL STEP
-            dex_logger.info(f"Step 3: Running RugCheck for token: {token_address}")
             rug_check = await self.basic_rug_check(token)
-            
             if not rug_check["passed"]:
-                dex_logger.info(f"❌ Token {token_address} FAILED RugCheck - excluding from dashboard")
-                # Still save to DB but mark as failed
-                await self.save_failed_token(token, rug_check)
-                continue
-            else:
-                dex_logger.info(f"✅ Token {token_address} PASSED RugCheck - will be monitored")
-
-            # Only process tokens that passed RugCheck
-            # Look for Twitter links in the metadata we got from DexScreener
-            if "links" not in token:
-                dex_logger.info(f"No social links found for token: {token_address}")
-                # Still save passed tokens even without Twitter
-                await self.save_passed_token(token, rug_check)
+                dex_logger.info(f"Skipping token {token_address} - failed basic rug check")
                 continue
 
-            # Extract Twitter profiles for passed tokens
             for link in token["links"]:
                 if link.get("type") == "twitter" or "twitter.com" in link.get("url", "") or "x.com" in link.get("url", ""):
                     profile_url = link["url"]
@@ -675,7 +421,6 @@ class SolanaTwitterMonitor:
                             "createdAt": datetime.now(mst)
                         })
 
-        dex_logger.info(f"Found {len(twitter_profiles)} Twitter profiles from tokens that passed RugCheck")
         return twitter_profiles
 
     async def verify_twitter_account(self, username: str) -> Dict:
@@ -864,101 +609,6 @@ class SolanaTwitterMonitor:
                 dex_logger.error(f"Error in monitoring task: {str(e)}")
                 await asyncio.sleep(60)
 
-    async def monitor_token_marketcaps(self):
-        """Background task to monitor market caps of tokens that passed rug check"""
-        dex_logger.info("Starting market cap monitoring background task")
-        if not await self.is_db_initialized():
-            await self.initialize_db()
-
-        while not self.shutdown_flag:
-            try:
-                start_time = time.time()
-
-                # Find tokens that passed rug check and need market cap monitoring
-                # Only monitor tokens that explicitly passed RugCheck
-                cursor = self.db.tokens.find({
-                    "status": "passed_rugcheck",  # Only tokens that passed our flow
-                    "rugCheck.passed": True,
-                    "source": "birdeye",
-                    "monitorMarketCap": True,  # Explicitly flagged for monitoring
-                    "$or": [
-                        {"lastMarketCapCheck": {"$exists": False}},
-                        {"lastMarketCapCheck": {"$lt": datetime.now(mst) - timedelta(seconds=self.marketcap_monitor_interval)}}
-                    ]
-                }).sort("processedAt", -1).limit(20)  # Focus on recently processed tokens
-
-                tokens = await cursor.to_list(length=30)
-
-                if tokens:
-                    dex_logger.info(f"Monitoring market cap for {len(tokens)} tokens")
-
-                    updates = []
-                    successful_updates = 0
-                    
-                    for token in tokens:
-                        try:
-                            token_address = token["tokenAddress"]
-                            market_data = await self.monitor_token_marketcap(token_address)
-
-                            if market_data:
-                                # Calculate market cap change
-                                old_mc = token.get("currentMarketCap", 0)
-                                new_mc = market_data["marketCap"]
-                                mc_change = ((new_mc - old_mc) / old_mc * 100) if old_mc > 0 else 0
-
-                                # Store market cap history
-                                await self.db.marketcap_history.insert_one({
-                                    "tokenAddress": token_address,
-                                    "marketCap": new_mc,
-                                    "price": market_data["price"],
-                                    "volume24h": market_data["volume24h"],
-                                    "priceChange24h": market_data["priceChange24h"],
-                                    "liquidity": market_data["liquidity"],
-                                    "marketCapChange": mc_change,
-                                    "timestamp": market_data["timestamp"]
-                                })
-
-                                # Update token with latest data
-                                updates.append(UpdateOne(
-                                    {"tokenAddress": token_address},
-                                    {"$set": {
-                                        "currentMarketCap": new_mc,
-                                        "currentPrice": market_data["price"],
-                                        "currentVolume24h": market_data["volume24h"],
-                                        "currentLiquidity": market_data["liquidity"],
-                                        "marketCapChange": mc_change,
-                                        "lastMarketCapCheck": datetime.now(mst)
-                                    }}
-                                ))
-
-                                successful_updates += 1
-                                dex_logger.info(f"Updated {token_address}: ${new_mc:,.0f} ({mc_change:+.1f}%)")
-
-                            else:
-                                # Mark as checked even if failed to avoid constant retries
-                                updates.append(UpdateOne(
-                                    {"tokenAddress": token_address},
-                                    {"$set": {"lastMarketCapCheck": datetime.now(mst)}}
-                                ))
-
-                        except Exception as e:
-                            dex_logger.error(f"Error monitoring market cap for {token.get('tokenAddress')}: {str(e)}")
-
-                        # Small delay between requests
-                        await asyncio.sleep(0.1)
-
-                    if updates:
-                        await self.db.tokens.bulk_write(updates)
-                        dex_logger.info(f"Successfully updated {successful_updates}/{len(updates)} tokens")
-
-                elapsed = time.time() - start_time
-                sleep_time = max(5, int(self.marketcap_monitor_interval - elapsed))  # Minimum 5 second sleep
-                await asyncio.sleep(sleep_time)
-
-            except Exception as e:
-                dex_logger.error(f"Error in market cap monitoring task: {str(e)}")
-                await asyncio.sleep(30)  # Shorter retry delay
-
     async def run(self):
         dex_logger.info("Starting Solana Twitter monitoring system")
         await self.initialize_db()
@@ -969,7 +619,6 @@ class SolanaTwitterMonitor:
 
         try:
             self.monitoring_task = asyncio.create_task(self.monitor_existing_accounts())
-            self.marketcap_task = asyncio.create_task(self.monitor_token_marketcaps())
 
             while not self.shutdown_flag:
                 try:
@@ -1014,15 +663,6 @@ class SolanaTwitterMonitor:
                     dex_logger.info("Monitoring task cancelled successfully")
                 except Exception as e:
                     dex_logger.error(f"Error while cancelling monitoring task: {str(e)}")
-
-            if self.marketcap_task and not self.marketcap_task.done():
-                self.marketcap_task.cancel()
-                try:
-                    await self.marketcap_task
-                except asyncio.CancelledError:
-                    dex_logger.info("Market cap monitoring task cancelled successfully")
-                except Exception as e:
-                    dex_logger.error(f"Error while cancelling market cap task: {str(e)}")
 
             await self.close()
             dex_logger.info("Shutdown complete")

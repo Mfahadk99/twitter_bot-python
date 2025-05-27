@@ -158,130 +158,21 @@ selected_page = st.sidebar.radio("Navigation", pages)
 if selected_page == "Solana Tokens":
     st.header("🪙 Solana Tokens Analysis")
 
-    # Token Overview Metrics following correct flow
+    # Token Overview Metrics (unchanged)
     total_tokens = db.tokens.count_documents({})
-    tokens_processed = db.tokens.count_documents({"processed": True})
-    rug_passed = db.tokens.count_documents({"status": "passed_rugcheck"})
-    rug_failed = db.tokens.count_documents({"status": "failed_rugcheck"})
-    monitored_tokens = db.tokens.count_documents({"monitorMarketCap": True, "currentMarketCap": {"$exists": True}})
-    from_birdeye = db.tokens.count_documents({"source": "birdeye"})
-    
+    tokens_with_twitter = db.tokens.count_documents({"processed": True})
+    rug_passed = db.tokens.count_documents({"rugCheck.passed": True})
     avg_score = list(db.tokens.aggregate([
         {"$match": {"rugCheck.score": {"$exists": True}}},
         {"$group": {"_id": None, "avgScore": {"$avg": "$rugCheck.score"}}}
     ]))
     avg_score = avg_score[0]['avgScore'] if avg_score else 0
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Tokens", total_tokens)
-    col2.metric("🦅 From Birdeye", from_birdeye)
-    col3.metric("✅ Passed RugCheck", rug_passed)
-    col4.metric("❌ Failed RugCheck", rug_failed)
-    col5.metric("📈 Being Monitored", monitored_tokens)
-    col6.metric("Avg Rug Score", f"{avg_score:.2f}")
-
-    # Market Cap Monitoring Section
-    st.subheader("📈 Real-time Market Cap Monitoring")
-    
-    # Auto-refresh indicator
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.write("**Live Token Performance** (Auto-refreshes every 60 seconds)")
-    with col2:
-        if st.button("🔄 Refresh Now"):
-            st.rerun()
-
-    # Get tokens with recent market cap data - ONLY show tokens that passed RugCheck
-    recent_marketcap = list(db.tokens.find({
-        "status": "passed_rugcheck",  # Only tokens that passed our validation flow
-        "rugCheck.passed": True,
-        "currentMarketCap": {"$exists": True},
-        "source": "birdeye"
-    }).sort("lastMarketCapCheck", -1).limit(15))
-
-    if recent_marketcap:
-        # Summary metrics
-        total_mc = sum(token.get('currentMarketCap', 0) for token in recent_marketcap)
-        avg_change = sum(token.get('marketCapChange', 0) for token in recent_marketcap if token.get('marketCapChange')) / len([t for t in recent_marketcap if t.get('marketCapChange')])
-        
-        st.metric("Total Market Cap (Top 15)", f"${total_mc:,.0f}", f"{avg_change:+.1f}% avg change" if avg_change else None)
-        
-        # Create a more detailed table view
-        for i, token in enumerate(recent_marketcap):
-            with st.container():
-                col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 1])
-                
-                with col1:
-                    symbol = token.get('symbol', 'Unknown')
-                    name = token.get('name', 'Unknown')
-                    st.write(f"**{symbol}**")
-                    st.caption(f"{name[:20]}...")
-                    st.caption(f"{token['tokenAddress'][:12]}...")
-                
-                with col2:
-                    market_cap = token.get('currentMarketCap', 0)
-                    mc_change = token.get('marketCapChange', 0)
-                    st.metric("Market Cap", 
-                             f"${market_cap:,.0f}" if market_cap else "N/A",
-                             f"{mc_change:+.1f}%" if mc_change else None)
-                
-                with col3:
-                    price = token.get('currentPrice', 0)
-                    price_change = token.get('priceChange24h', 0)
-                    st.metric("Price", 
-                             f"${price:.6f}" if price else "N/A",
-                             f"{price_change:+.1f}%" if price_change else None)
-                
-                with col4:
-                    volume = token.get('currentVolume24h', 0)
-                    liquidity = token.get('currentLiquidity', 0)
-                    st.metric("Volume 24h", f"${volume:,.0f}" if volume else "N/A")
-                    st.caption(f"Liquidity: ${liquidity:,.0f}" if liquidity else "No data")
-                
-                with col5:
-                    last_check = token.get('lastMarketCapCheck')
-                    if last_check:
-                        time_diff = datetime.now(mst) - last_check.replace(tzinfo=mst)
-                        if time_diff.total_seconds() < 60:
-                            st.success("🟢 Live")
-                        elif time_diff.total_seconds() < 300:
-                            st.warning("🟡 Recent")
-                        else:
-                            st.error("🔴 Stale")
-                        st.caption(f"Updated: {last_check.strftime('%H:%M:%S')}")
-                    else:
-                        st.error("❓ No data")
-                
-                # Add progress indicator for high-performing tokens
-                if mc_change and abs(mc_change) > 10:
-                    color = "green" if mc_change > 0 else "red"
-                    st.markdown(f"<div style='background-color: {color}; opacity: 0.1; height: 2px; width: 100%;'></div>", unsafe_allow_html=True)
-                else:
-                    st.divider()
-    else:
-        st.info("No tokens with market cap data yet. Wait for monitoring to begin.")
-        st.write("The system needs to:")
-        st.write("1. Fetch new tokens from Birdeye")
-        st.write("2. Run RugCheck analysis")
-        st.write("3. Start market cap monitoring for passed tokens")
-
-    # Market Cap History Chart
-    if st.button("📊 Show Market Cap Trends"):
-        history_data = list(db.marketcap_history.find({}).sort("timestamp", -1).limit(100))
-        if history_data:
-            df_history = pd.DataFrame([{
-                'timestamp': h['timestamp'],
-                'token': h['tokenAddress'][:8] + '...',
-                'marketCap': h['marketCap'],
-                'price': h['price']
-            } for h in history_data])
-
-            fig = px.line(df_history, x='timestamp', y='marketCap', color='token',
-                         title="Market Cap Over Time", 
-                         labels={'marketCap': 'Market Cap ($)', 'timestamp': 'Time'})
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No market cap history available yet.")
+    col2.metric("With Twitter Profiles", tokens_with_twitter)
+    col3.metric("Passed Rug Check", rug_passed)
+    col4.metric("Avg Rug Score", f"{avg_score:.2f}")
 
     # Add filters (unchanged)
     st.subheader("🔍 Filter Tokens")
@@ -352,24 +243,6 @@ if selected_page == "Solana Tokens":
                 """, unsafe_allow_html=True)
 
                 st.write(f"**Created:** {token.get('createdAt', datetime.utcnow()).strftime('%Y-%m-%d %H:%M')}")
-
-                # Show token source
-                source = token.get('source', 'dexscreener')
-                source_emoji = "🦅" if source == "birdeye" else "📊"
-                st.write(f"**Source:** {source_emoji} {source.title()}")
-
-                # Show Birdeye-specific data if available
-                if source == "birdeye":
-                    current_mc = token.get('currentMarketCap')
-                    current_price = token.get('currentPrice')
-                    if current_mc:
-                        st.write(f"**Current Market Cap:** ${current_mc:,.0f}")
-                    if current_price:
-                        st.write(f"**Current Price:** ${current_price:.6f}")
-
-                    last_check = token.get('lastMarketCapCheck')
-                    if last_check:
-                        st.write(f"**Last Updated:** {last_check.strftime('%H:%M:%S')}")
 
                 if 'rugCheck' in token:
                     rug = token['rugCheck']
@@ -828,7 +701,7 @@ elif selected_page == "Account Management":
                     if 'email' in account and account['email']:
                         st.write(f"**Email:** {account['email']}")
                     if 'proxy' in account and account['proxy']:
-                        st.write(f`**Proxy:** {account['proxy']}")
+                        st.write(f"**Proxy:** {account['proxy']}")
                 with col2:
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
