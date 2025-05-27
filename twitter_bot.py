@@ -107,6 +107,13 @@ class SolanaTwitterMonitor:
         self.wallet = self._initialize_wallet()
         self.rugcheck_token = None
 
+        self.birdeye_url = "https://public-api.birdeye.so/defi/tokenlist"
+        self.birdeye_headers = {
+            "X-API-KEY": os.getenv("BIRDEYE_API_KEY"),
+            'Accept': 'application/json',
+            'x-chain': 'solana'
+        }
+
     async def initialize_db(self):
         self.client = AsyncIOMotorClient(self.mongo_uri)
         self.db = self.client.twitter_monitor
@@ -241,7 +248,15 @@ class SolanaTwitterMonitor:
         rug_logger.error(f"Failed after {max_retries} attempts")
         raise last_exception if last_exception else Exception("Unknown error in handle_twitter_request")
 
-    async def rate_limited_get(self, url: str) -> Optional[Dict]:
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    async def rate_limited_get(self, url: str, headers: Optional[Dict] = None) -> Optional[Dict]:
         now = time.time()
 
         while self.request_times and now - self.request_times[0] > 60:
@@ -253,62 +268,150 @@ class SolanaTwitterMonitor:
             await asyncio.sleep(sleep_time)
 
         try:
-            async with self.session.get(url) as response:
+            async with self.session.get(url, headers=headers) as response:
                 self.request_times.append(time.time())
                 if response.status == 200:
                     data = await response.json()
-                    with open(dex_response_file_path, 'a') as f:
-                        f.write(json.dumps(data) + '\n')
                     return data
-                rug_logger.error(f"Failed to fetch data: HTTP {response.status}")
-                return None
+                else:
+                    rug_logger.error(f"Failed to fetch data from {url}: HTTP {response.status}")
+                    return None
         except Exception as e:
-            rug_logger.error(f"Error in rate_limited_get: {str(e)}")
+            rug_logger.error(f"Error in rate_limited_get for {url}: {str(e)}")
             return None
+
+    async def fetch_birdeye_tokens(self) -> List[Dict]:
+        try:
+            rug_logger.info("Fetching tokens from Birdeye...")
+            data = await self.rate_limited_get(self.birdeye_url, self.birdeye_headers)
+            
+            if not data:
+                rug_logger.error("No data received from Birdeye")
+                return []
+            
+            tokens = []
+            if isinstance(data, dict):
+                if 'data' in data and 'tokens' in data['data']:
+                    tokens = data['data']['tokens']
+                elif 'tokens' in data:
+                    tokens = data['tokens']
+                else:
+                    tokens = [data] if isinstance(data, dict) else data
+            elif isinstance(data, list):
+                tokens = data
+            
+            rug_logger.info(f"Retrieved {len(tokens)} tokens from Birdeye")
+            return tokens[:50]
+            
+        except Exception as e:
+            rug_logger.error(f"Error fetching from Birdeye: {str(e)}")
+            return []
 
     async def fetch_latest_solana_tokens(self) -> List[Dict]:
         try:
-            dexscreener_tokens = await self._fetch_dexscreener_tokens()
-
-            combined_tokens = dexscreener_tokens
-            unique_tokens = {}
-
-            valid_tokens = []
-            for token in combined_tokens:
-                token_address = token.get("tokenAddress")
-                if token_address and len(token_address) == 44:
-                    valid_tokens.append(token)
-                    dex_logger.info(f"Processing token address: {token_address}")
-                elif token_address:
-                    rug_logger.debug(f"Skipping invalid token address format: {token_address}")
-
-            for token in valid_tokens[:1000]:
-                token_address = token.get("tokenAddress")
-                if token_address not in unique_tokens or "links" in token:
-                    unique_tokens[token_address] = token
-
-            return list(unique_tokens.values())
-
-        except Exception as e:
-            rug_logger.error(f"Error fetching Solana tokens: {str(e)}")
-            return []
-
-    async def _fetch_dexscreener_tokens(self) -> List[Dict]:
-        try:
-            data = await self.rate_limited_get(self.dexscreener_url)
-            if not data:
+            birdeye_tokens = await self.fetch_birdeye_tokens()
+            
+            if not birdeye_tokens:
+                rug_logger.warning("No tokens retrieved from Birdeye, using fallback")
                 return []
-
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                if "results" in data:
-                    return data["results"]
-                return [data]
-            rug_logger.error(f"Unexpected API response format: {type(data)}")
-            return []
+            
+            results = []
+            
+            for token in birdeye_tokens:
+                token_address = None
+                if isinstance(token, dict):
+                    token_address = (token.get('address') or 
+                                   token.get('tokenAddress') or 
+                                   token.get('mint') or 
+                                   token.get('id'))
+                elif isinstance(token, str):
+                    token_address = token
+                
+                if not token_address or len(token_address) != 44:
+                    continue
+                
+                dex_logger.info(f"Processing token: {token_address}")
+                
+                metadata = await self.fetch_dexscreener_metadata(token_address)
+                if metadata:
+                    results.append(metadata)
+                    dex_logger.info(f"Successfully processed token: {token_address}")
+                
+                await asyncio.sleep(0.5)
+            
+            rug_logger.info(f"Successfully processed {len(results)} tokens")
+            return results
+            
         except Exception as e:
-            rug_logger.error(f"Error fetching from DexScreener API: {str(e)}")
+            rug_logger.error(f"Error in fetch_latest_solana_tokens: {str(e)}")
+            return []
+       
+    async def fetch_dexscreener_metadata(self, token_address: str) -> Optional[Dict]:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            data = await self.rate_limited_get(url)
+            
+            if not data:
+                return None
+            
+            pairs = data.get('pairs', [])
+            if not pairs:
+                return None
+            
+            selected_pair = None
+            for pair in pairs:
+                info = pair.get('info', {})
+                has_socials = 'socials' in info and info['socials']
+                has_websites = 'websites' in info and info['websites']
+                
+                if has_socials or has_websites:
+                    selected_pair = pair
+                    break
+            
+            if not selected_pair:
+                rug_logger.debug(f"No pair with social links found for token: {token_address}")
+                return None
+            
+            base_token = selected_pair.get('baseToken', {})
+            
+            formatted_data = {
+                "url": f"https://dexscreener.com/solana/{selected_pair.get('pairAddress', '').lower()}",
+                "chainId": "solana",
+                "tokenAddress": token_address,
+                "icon": f"https://dd.dexscreener.com/ds-data/tokens/solana/{token_address}.png",
+                "header": f"https://dd.dexscreener.com/ds-data/tokens/solana/{token_address}/header.png",
+                "openGraph": f"https://cdn.dexscreener.com/token-images/og/solana/{token_address}?timestamp={int(time.time() * 1000)}",
+                "description": selected_pair.get('info', {}).get('description', '') or base_token.get('name', ''),
+                "links": []
+            }
+            
+            info = selected_pair.get('info', {})
+            if 'socials' in info:
+                for social in info['socials']:
+                    social_type = social.get('type', '').lower()
+                    url = social.get('url', '')
+                    if url:
+                        formatted_data['links'].append({
+                            "type": social_type,
+                            "url": url
+                        })
+            
+            if 'websites' in info:
+                for website in info['websites']:
+                    url = website.get('url', '')
+                    if url:
+                        formatted_data['links'].append({
+                            "label": "Website",
+                            "url": url
+                        })
+            if not formatted_data['links']:
+                rug_logger.debug(f"No valid links found for token: {token_address}")
+                return None
+                
+            return formatted_data
+            
+        except Exception as e:
+            rug_logger.error(f"Error fetching DexScreener metadata for {token_address}: {str(e)}")
             return []
 
     async def is_token_processed(self, token_address: str) -> bool:
@@ -342,10 +445,11 @@ class SolanaTwitterMonitor:
             }
 
         processed_risks = []
-        for risk in report.get("risks", []):
-            if risk.get("level") == "warn":
-                risk["level"] = "good"
-            processed_risks.append(risk)
+        if "risks" in report and report["risks"]:
+            for risk in report["risks"]:
+                if risk.get("level") == "warn":
+                    risk["level"] = "good"
+                processed_risks.append(risk)
 
         has_warnings = any(
             risk.get("level") in ["danger"]
@@ -389,14 +493,14 @@ class SolanaTwitterMonitor:
         processed_tokens = set()
 
         for token in tokens:
+            print(f"token:{token}")
             if "links" not in token:
+                print(f"come in not found token:{token}")
                 continue
 
             token_address = token.get("tokenAddress", "")
-            if not token_address or token_address in processed_tokens:
-                continue
-
             processed_tokens.add(token_address)
+            print(f"processed_tokens:{processed_tokens}")
 
             if await self.is_token_processed(token_address):
                 continue
